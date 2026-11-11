@@ -1,0 +1,842 @@
+openapi: 3.0.3
+
+info:
+  title: Just Dance Nakama API
+  version: 1.0.0
+  description: |
+    15 important Nakama endpoints in the Just Dance TV project
+
+    **Base URL:** `http://185.7.212.199:7350` | **SSL:** false
+    **Server Key:** `e6f10428957017d3dfff463c7b81c5b3` â†’ Base64 `ZTZmMTA0Mjg5NTcwMTdkM2RmZmY0NjNjN2I4MWM1YjM6`
+
+    ## Common RPC Notes
+    - URL: `POST /v2/rpc/{rpc_name}`
+    - Auth: `Authorization: Bearer {access_token}`
+    - Body: double-encoded JSON string â€” e.g. `"{\"deviceId\":\"...\"}"` not a raw object
+    - Response: `{"payload": "{\"key\":\"value\"}"}` â€” payload is inside a string
+    - 401: refresh once + retry
+
+    ## Overall TV Flow
+    authenticate/device â†’ WebSocket â†’ GET account â†’ POST storage â†’ generateLinkLoginCode
+    â†’ notification poll â†’ authenticate (linked) â†’ getServerTime â†’ sendNotification â†’ frameSync
+
+  contact:
+    name: Just Dance Backend Team
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://185.7.212.199:7350
+    description: Production â€” SSL false
+  - url: http://192.168.5.20:7350
+    description: Internal Dev
+
+tags:
+  - name: Authentication
+    description: Login, refresh, account, logout
+  - name: WebSocket
+    description: Realtime channel â€” QR, sync, score
+  - name: RPC
+    description: Remote Procedure Calls (double-encoded JSON)
+  - name: Storage
+    description: Read/write config and profile
+  - name: Notifications
+    description: Polling fallback for QR approval
+
+paths:
+  /v2/account/authenticate/device:
+    post:
+      tags: [Authentication]
+      summary: '1. Device Authentication â€” foundation of everything â­â­â­â­â­'
+      description: |
+        **Purpose:** First login step â€” sign in with Device ID without username/password.
+        **Auth:** Basic base64(serverKey:)
+        **Body:** `{"id": "device-uuid"}`
+
+        **Who:** TV (every Connect), Mobile, ws-test
+        **Frequency:** Every boot, after refresh expires, after QR approval
+
+        **Device ID:**
+        - Guest TV: `tv-guest-link-notify`
+        - Linked TV: `tv-` + random + `-` + timestamp
+        - Mobile: UUID in localStorage (`nakama.deviceId`)
+      operationId: authenticateDevice
+      security:
+        - basicServerKey: []
+      parameters:
+        - name: create
+          in: query
+          schema:
+            type: boolean
+            default: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceAuthRequest'
+            example:
+              id: tv-guest-link-notify
+      responses:
+        '200':
+          description: token, refresh_token, created, username
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+  /ws:
+    get:
+      tags: [WebSocket]
+      summary: '2. WebSocket â€” realtime channel â­â­â­â­â­'
+      description: |
+        **URL:** `ws://185.7.212.199:7350/ws?token={access_token}&status=false`
+
+        **Purpose:** Receive realtime notifications (QR approval, video sync, score, disconnect).
+        **Auth:** token in query string.
+        **Who:** TV (required for QR), Mobile (optional).
+        **Frequency:** Always open during an active TV session.
+
+        Without WebSocket, QR login on TV does not work.
+
+        **After QR pairing (code 4):**
+        1. disconnect WebSocket
+        2. authenticate/device again
+        3. reconnect with new token
+      operationId: websocketConnect
+      servers:
+        - url: ws://185.7.212.199:7350
+          description: Nakama WebSocket
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+          description: access_token from authenticate/device
+        - name: status
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: TV uses false
+        - name: lang
+          in: query
+          schema:
+            type: string
+            default: en
+      responses:
+        '101':
+          description: WebSocket established
+        '401':
+          description: Invalid or expired token
+
+  /v2/rpc/rpc_multiSession_sendNotificationToSessions:
+    post:
+      tags: [RPC, Notifications]
+      summary: '3. Send Notification to Sessions â€” heart of TV â†” Unity â­â­â­â­â­'
+      description: |
+        **Purpose:** Send notifications to linked sessions (TV â†” mobile/Unity).
+        **Auth:** Bearer access_token
+        **Body:** double-encoded JSON string
+
+        **Important TV codes:**
+
+        | Code | Name | Purpose |
+        |------|------|---------|
+        | 6 | WaitingForVideoPlayReady | TV ready to play |
+        | 9 | VideoDownloadIntent | Start video download |
+        | 10 | VideoTvReady | TV ready for sync |
+        | 13 | OnDanceVideoFinished | Dance finished |
+        | 14 | ReturnToSongList | Return to list |
+        | 17 | SessionEnded | Session ended |
+
+        **Frequency:** Throughout the game flow â€” from pairing to end of dance.
+        **Note:** TV must not send code 12 (VideoSyncStart) â€” server only.
+      operationId: rpcMultiSessionSendNotificationToSessions
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RpcTvBody'
+            examples:
+              videoTvReady:
+                summary: code 10 â€” TV ready for sync
+                value: '{"subject":"VideoTvReady","code":10,"content":{"videoId":1}}'
+              waitingReady:
+                summary: code 6
+                value: '{"subject":"client-uuid","code":6,"content":{}}'
+      responses:
+        '200':
+          description: Notification queued for WebSocket delivery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RpcResponseEnvelope'
+
+  /v2/account/session/refresh:
+    post:
+      tags: [Authentication]
+      summary: '4. Session Refresh â€” renew token â­â­â­â­â­'
+      description: |
+        **Purpose:** Renew access token when expired (important during 5â€“15 minute preload).
+        **Auth:** Bearer refresh_token â€” **not** access token
+        **Body:** empty
+
+        **Frequency:** On 401, before expire, during recovery
+
+        **Flow:**
+        RPC/REST â†’ 401 â†’ refresh â†’ retry
+                   â†“ fail
+              authenticate/device again
+      operationId: refreshSession
+      security:
+        - bearerRefreshAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              maxProperties: 0
+      responses:
+        '200':
+          description: New token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+  /v2/rpc/rpc_getServerTime:
+    post:
+      tags: [RPC]
+      summary: '5. Get Server Time â€” clock sync â­â­â­â­'
+      description: |
+        **Purpose:** Sync TV clock with server for synchronized video playback.
+        **Auth:** Bearer access_token | **Body:** `"{}"`
+        **Frequency:** Every 30 seconds + before VideoSyncStart + after WS reconnect
+        **File:** tv/ClockSynchronizer.js
+      operationId: rpcGetServerTime
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RpcTvBody'
+            example: '{}'
+      responses:
+        '200':
+          description: serverTimeMs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RpcResponseEnvelope'
+              example:
+                payload: '{"serverTimeMs":1722153600123}'
+
+  /v2/rpc/rpc_multiSession_generateLinkLoginCode:
+    post:
+      tags: [RPC]
+      summary: '6. Generate Link Login Code â€” QR pairing â­â­â­â­'
+      description: |
+        **Purpose:** Generate login code for QR â€” pair TV with mobile/Unity.
+        **Auth:** Bearer access_token
+        **Body:** `"{\"deviceId\":\"tv-abc123-1722153600\"}"`
+        **Client TTL:** 5 minutes â€” after that QR is regenerated.
+      operationId: rpcMultiSessionGenerateLinkLoginCode
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RpcTvBody'
+            example: '{"deviceId":"tv-abc123-1722153600"}'
+      responses:
+        '200':
+          description: loginCode, expiresAt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RpcResponseEnvelope'
+              example:
+                payload: '{"loginCode":"123456","expiresAt":1722153900}'
+
+  /v2/notification:
+    get:
+      tags: [Notifications]
+      summary: '7. Poll Notifications â€” fallback QR approval â­â­â­â­'
+      description: |
+        **Purpose:** Poll notifications when WebSocket is slow or QR approval did not arrive via WS.
+        **Auth:** Bearer access_token
+        **Frequency:** Every 3 seconds until approval
+        **Goal:** Receive code 4 (ReceiveAcceptedLinkLoginCode)
+      operationId: listNotifications
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: List of notifications
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotificationPayload'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+  /v2/rpc/rpc_frameSync_pulse:
+    post:
+      tags: [RPC]
+      summary: '8. Frame Sync Pulse â€” sync gameplay â­â­â­â­'
+      description: |
+        **Purpose:** Sync frames during dance between TV and Unity.
+        **Auth:** Bearer access_token
+        **Frequency:** Every 100ms (10 times per second) during gameplay
+        **File:** tv/FrameSyncEngine.js â€” concurrent RPC (non-blocking)
+
+        **Stale packet:** Ignore responses where sequence <= lastReceivedSequence.
+      operationId: rpcFrameSyncPulse
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RpcTvBody'
+            example: '{"clientRole":"tv","clientRttMs":0,"clientOffsetMs":0,"playerCount":2,"lastReceivedSequence":42}'
+      responses:
+        '200':
+          description: frameSync state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RpcResponseEnvelope'
+              example:
+                payload: '{"frameSync":{"frameIndex":42,"referenceTime":2.5,"sequence":1}}'
+
+  /v2/storage:
+    post:
+      tags: [Storage]
+      summary: '9. Read Storage â€” server config â­â­â­'
+      description: |
+        **Purpose:** Read config and stored data.
+        **Auth:** Bearer access_token
+        **Who:** After Connect on TV, on Mobile for game modes
+      operationId: storageRead
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageReadRequest'
+            example:
+              object_ids:
+                - collection: server_configuration
+                  key: public_server
+                  user_id: ""
+      responses:
+        '200':
+          description: Storage objects
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageReadResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+    put:
+      tags: [Storage]
+      summary: '12. Write Storage â€” save profile â­â­'
+      description: |
+        **Purpose:** Save TV user profile.
+        **Auth:** Bearer access_token
+        **Collection:** profile_configuration / profile_public_mutable
+        **Note:** value must be a JSON string, not an object.
+      operationId: storageWrite
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageWriteRequest'
+            example:
+              objects:
+                - collection: profile_configuration
+                  key: profile_public_mutable
+                  value: '{"userId":"...","platform":"smart_tv","stats":{"sessions":1}}'
+                  permission_read: 1
+                  permission_write: 1
+      responses:
+        '200':
+          description: Write acknowledged
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+  /v2/account:
+    get:
+      tags: [Authentication]
+      summary: '10. Get Account â€” resolve user_id â­â­â­'
+      description: |
+        **Purpose:** Get user_id when it is not in the auth response.
+        **Auth:** Bearer access_token
+        **Who:** TV only â€” assignSessionToState()
+        **Frequency:** Once after authenticate
+      operationId: getAccount
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: user.id, devices, wallet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+  /v2/rpc/rpc_multiSession_unlinkDevice:
+    post:
+      tags: [RPC]
+      summary: '11. Unlink Device â€” disconnect pairing â­â­â­'
+      description: |
+        **Purpose:** Unlink device from multi-session group.
+        **Auth:** Bearer access_token
+
+        **TV reasons:**
+
+        | Reason | When |
+        |--------|------|
+        | tv_reset | reset pairing |
+        | unload | close tab |
+        | unknown | default |
+      operationId: rpcMultiSessionUnlinkDevice
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RpcTvBody'
+            example: '{"deviceId":"tv-abc123","userId":"uuid","reason":"tv_reset"}'
+      responses:
+        '200':
+          description: Device unlinked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RpcResponseEnvelope'
+
+  /v2/rpc/rpc_generateSyncStartAt:
+    post:
+      tags: [RPC]
+      summary: '13. Generate Sync Start At â€” server-only â­â­â­'
+      description: |
+        **Purpose:** Trigger synchronized video start â€” **server only** calls this.
+        **TV:** Does not call directly.
+        **Effect:** notification code 12 (VideoSyncStart) with subject=VideoSyncStart
+
+        **notification payload:** `{"videoId": 1, "startAt": 1722153600000}`
+
+        **Flow:** TV Ready (10) â†’ Unity Ready (11) â†’ this RPC â†’ code 12 â†’ synchronized playback
+      operationId: rpcGenerateSyncStartAt
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RpcTvBody'
+            example: '{"videoId":1}'
+      responses:
+        '200':
+          description: startAt scheduled + notification code 12
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RpcResponseEnvelope'
+              example:
+                payload: '{"videoId":1,"startAt":1722153600000}'
+
+  /v2/storage/{collection}:
+    get:
+      tags: [Storage]
+      summary: '14. List Storage Objects â€” list videos (Mobile) â­â­'
+      description: |
+        **Purpose:** List videos from the videos collection.
+        **Auth:** Bearer access_token
+        **Who:** Mobile SDK â€” client.listStorageObjects()
+        **Pagination:** cursor loop until empty
+        **File:** src/storage.js â†’ loadVideos()
+      operationId: storageListCollection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: collection
+          in: path
+          required: true
+          schema:
+            type: string
+          example: videos
+        - name: user_id
+          in: query
+          schema:
+            type: string
+          description: Empty for system-owned
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+  /v2/session/logout:
+    post:
+      tags: [Authentication]
+      summary: '15. Session Logout â€” sign out (Mobile) â­â­'
+      description: |
+        **Purpose:** Invalidate session.
+        **Auth:** Bearer access_token
+        **Who:** Mobile â€” logout() in src/nakama.js
+        **TV:** Does **not** call Nakama logout API
+      operationId: sessionLogout
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: Session invalidated
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+
+components:
+  securitySchemes:
+    basicServerKey:
+      type: http
+      scheme: basic
+      description: |
+        Endpoint 1 only (authenticate/device).
+        Server Key: e6f10428957017d3dfff463c7b81c5b3:
+        Base64: ZTZmMTA0Mjg5NTcwMTdkM2RmZmY0NjNjN2I4MWM1YjM6
+
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: access_token â€” for RPC, storage, account, logout
+
+    bearerRefreshAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: refresh_token â€” endpoint 4 only (session/refresh)
+
+  schemas:
+    DeviceAuthRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          example: tv-guest-link-notify
+        vars:
+          type: object
+          additionalProperties:
+            type: string
+
+    SessionResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        refresh_token:
+          type: string
+        created:
+          type: boolean
+        username:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+
+    Account:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/AccountUser'
+        wallet:
+          type: string
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountDevice'
+
+    AccountUser:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        display_name:
+          type: string
+
+    AccountDevice:
+      type: object
+      properties:
+        id:
+          type: string
+        user_id:
+          type: string
+
+    RpcTvBody:
+      type: string
+      description: |
+        TV style â€” raw JSON string as HTTP body (double-encoded).
+        Example: "{\"deviceId\":\"tv-abc123\"}"
+      example: '{"deviceId":"tv-abc123"}'
+
+    RpcRequestEnvelope:
+      type: object
+      description: SDK style â€” payload field contains stringified JSON
+      properties:
+        payload:
+          type: string
+          example: '{"deviceId":"tv-abc123"}'
+
+    RpcResponseEnvelope:
+      type: object
+      properties:
+        payload:
+          type: string
+          description: Stringified JSON response
+          example: '{"serverTimeMs":1722153600123}'
+
+    StorageReadRequest:
+      type: object
+      required: [object_ids]
+      properties:
+        object_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/StorageObjectId'
+
+    StorageObjectId:
+      type: object
+      properties:
+        collection:
+          type: string
+        key:
+          type: string
+        user_id:
+          type: string
+
+    StorageReadResponse:
+      type: object
+      properties:
+        objects:
+          type: array
+          items:
+            type: object
+            properties:
+              collection:
+                type: string
+              key:
+                type: string
+              value:
+                type: string
+
+    StorageWriteRequest:
+      type: object
+      required: [objects]
+      properties:
+        objects:
+          type: array
+          items:
+            type: object
+            properties:
+              collection:
+                type: string
+              key:
+                type: string
+              value:
+                type: string
+                description: Must be JSON string
+              permission_read:
+                type: integer
+              permission_write:
+                type: integer
+
+    StorageListResponse:
+      type: object
+      properties:
+        objects:
+          type: array
+          items:
+            type: object
+        cursor:
+          type: string
+
+    NotificationPayload:
+      type: object
+      properties:
+        id:
+          type: string
+        subject:
+          type: string
+        content:
+          type: object
+          additionalProperties: true
+        code:
+          type: integer
+          description: code 4 = ReceiveAcceptedLinkLoginCode
+        sender_id:
+          type: string
+        create_time:
+          type: string
+          format: date-time
+        persistent:
+          type: boolean
+
+  responses:
+    Unauthorized401:
+      description: Unauthorized â€” refresh or re-auth
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+              code:
+                type: integer
+
+x-endpoint-priority:
+  - rank: 1
+    endpoint: POST /v2/account/authenticate/device
+    importance: 5
+    frequency: every boot
+  - rank: 2
+    endpoint: ws://.../ws?token=...
+    importance: 5
+    frequency: always (TV)
+  - rank: 3
+    endpoint: RPC sendNotificationToSessions
+    importance: 5
+    frequency: continuous
+  - rank: 4
+    endpoint: POST /v2/account/session/refresh
+    importance: 5
+    frequency: on 401
+  - rank: 5
+    endpoint: RPC getServerTime
+    importance: 4
+    frequency: every 30s
+  - rank: 6
+    endpoint: RPC generateLinkLoginCode
+    importance: 4
+    frequency: every QR
+  - rank: 7
+    endpoint: GET /v2/notification
+    importance: 4
+    frequency: every 3s (QR poll)
+  - rank: 8
+    endpoint: RPC frameSync_pulse
+    importance: 4
+    frequency: 10/sec
+  - rank: 9
+    endpoint: POST /v2/storage (read)
+    importance: 3
+    frequency: after connect
+  - rank: 10
+    endpoint: GET /v2/account
+    importance: 3
+    frequency: once after auth
+  - rank: 11
+    endpoint: RPC unlinkDevice
+    importance: 3
+    frequency: reset/unload
+  - rank: 12
+    endpoint: PUT /v2/storage
+    importance: 2
+    frequency: save profile
+  - rank: 13
+    endpoint: RPC generateSyncStartAt
+    importance: 3
+    frequency: server-only
+  - rank: 14
+    endpoint: GET /v2/storage/videos
+    importance: 2
+    frequency: Mobile
+  - rank: 15
+    endpoint: POST /v2/session/logout
+    importance: 2
+    frequency: Mobile logout
+
+x-token-storage:
+  tv:
+    nakama.token: sessionStorage
+    nakama.refreshToken: sessionStorage
+    nakama.deviceId: localStorage
+  mobile:
+    nakama.token: localStorage
+    nakama.refreshToken: localStorage
+    nakama.deviceId: localStorage
+
+x-timeouts:
+  tvRestMs: 15000
+  mobileSocketMs: 10000
+  qrPollMs: 3000
+  serverTimeIntervalMs: 30000
+  frameSyncIntervalMs: 100
